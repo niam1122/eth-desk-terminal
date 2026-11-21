@@ -375,11 +375,20 @@ class RtdsChainlinkSession:
 
 
 @dataclass(frozen=True)
+class FilledPrint:
+    """One missing 1-second print replaced so an open TWAP can still be used."""
+
+    second: int
+    value: Decimal
+
+
+@dataclass(frozen=True)
 class BoundaryTwap:
     """Plain average of the 1-second prints in one settlement minute.
 
-    `price` is None when fewer than `minimum` seconds in `[start, end]` have
-    a print. Gaps are not filled.
+    `price` is None when fewer than `minimum` seconds in `[start, end]` are
+    available. The open minute may ask for one gap to be filled; that second
+    is listed on `fills`. Two or more gaps are never filled.
     """
 
     price: Decimal | None
@@ -389,6 +398,7 @@ class BoundaryTwap:
     offset: int
     minimum: int
     window_seconds: int
+    fills: tuple[FilledPrint, ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -424,21 +434,37 @@ def boundary_twap(
     seconds: int = TWAP_SECONDS,
     offset: int = DEFAULT_TWAP_OFFSET_SECONDS,
     min_prints: int = DEFAULT_MIN_TWAP_PRINTS,
+    fill_one: bool = False,
 ) -> BoundaryTwap:
     """Unweighted mean of the 1-second Chainlink prints in the settlement minute.
 
-    `prices` is keyed by unix second. A missing second is a gap: it is not
-    forward-filled and it is not treated as zero. When fewer than `min_prints`
-    seconds have a price, `price` is None and the caller must not trade.
+    `prices` is keyed by unix second. A missing second is not treated as zero.
+    With `fill_one`, a single missing second is replaced and the mean uses
+    every second in the window: the previous second's price, or the next
+    second's price when the gap is the first second of the window. The value
+    is taken from inside the window, not from the second before it. Two or
+    more missing seconds are left as a gap. When fewer than `min_prints`
+    seconds are available after that rule, `price` is None.
     """
 
     start, end = boundary_window(boundary_unix, seconds=seconds, offset=offset)
-    chosen = [prices[second] for second in range(start, end + 1) if second in prices]
-    count = len(chosen)
-    if count < min_prints or count == 0:
-        return BoundaryTwap(None, count, start, end, int(offset), int(min_prints), int(seconds))
-    mean = sum(chosen, Decimal("0")) / Decimal(count)
-    return BoundaryTwap(mean, count, start, end, int(offset), int(min_prints), int(seconds))
+    window = list(range(start, end + 1))
+    missing = [second for second in window if second not in prices]
+    observed = [prices[second] for second in window if second in prices]
+    observed_count = len(observed)
+    values = observed
+    fills: tuple[FilledPrint, ...] = ()
+    if fill_one and len(missing) == 1 and observed_count + 1 >= min_prints:
+        second = missing[0]
+        source = second + 1 if second == start else second - 1
+        source_price = prices.get(source)
+        if source_price is not None and source_price > 0:
+            values = [source_price if item == second else prices[item] for item in window]
+            fills = (FilledPrint(second, source_price),)
+    if len(values) < min_prints or len(values) == 0:
+        return BoundaryTwap(None, observed_count, start, end, int(offset), int(min_prints), int(seconds))
+    mean = sum(values, Decimal("0")) / Decimal(len(values))
+    return BoundaryTwap(mean, len(values), start, end, int(offset), int(min_prints), int(seconds), fills)
 
 
 def twap_gap_reason(kind: str, quote: BoundaryTwap, slug: str = "") -> str:
@@ -512,10 +538,14 @@ class ChainlinkFeed:
 
     The buffer is filled by one persistent RTDS connection to
     `crypto_prices_chainlink` (symbol `eth/usd`): the subscribe backfill plus
-    each live tick. The open, and the close used for paper settlement, are the
-    plain average of the 60 prints ending `twap_offset_seconds` before the
-    boundary (default 2). The crypto-price endpoint is not consulted.
-    `last_skip_reason` is set when the minute does not have enough prints.
+    each live tick. The open the model sees, and the close kept for the
+    settlement record, are the plain average of the 60 prints ending
+    `twap_offset_seconds` before the boundary (default 2). The open minute
+    forward-fills one missing second and records it for the journal. The
+    close minute does not: a short close is simply unavailable, and paper
+    settlement does not wait on it. The crypto-price endpoint is not
+    consulted. `last_skip_reason` is set when the open minute still does not
+    have enough prints.
 
     Pass `reader` only to inject prints in tests. The default opens the live socket.
     """
@@ -552,6 +582,8 @@ class ChainlinkFeed:
         )
         self.last_skip_reason: str | None = None
         self.last_refresh_error: str | None = None
+        self._notes: list[dict] = []
+        self._noted_fills: set[tuple] = set()
         self._session = (
             RtdsChainlinkSession(self.chainlink_spec, self.buffer) if reader is None else None
         )
@@ -576,7 +608,8 @@ class ChainlinkFeed:
             seconds_between(market.event_start, market.end),
         )
         self._ingest(now)
-        opened = self._quote(market.event_start)
+        opened = self._quote(market.event_start, fill_one=True)
+        self._record_fills(market.slug, market.event_start, opened, now)
         if not opened.ready:
             self.last_skip_reason = self._gap("open", opened, market.slug)
             return None
@@ -602,8 +635,39 @@ class ChainlinkFeed:
             window_end_unix=window_end_unix,
         )
 
+    def drain_notes(self) -> list[dict]:
+        """Journal lines for open-minute fills. Each missing second is emitted once."""
+
+        notes = self._notes
+        self._notes = []
+        return notes
+
+    def settlement_prices(self, position, now: datetime | None = None) -> tuple[Decimal | None, Decimal | None]:
+        """Strict open and close TWAPs for the settlement record.
+
+        Either side is None when that minute is short of `min_twap_prints`.
+        Nothing is filled here, and a short minute is not a skip: the caller
+        still settles from Polymarket's resolution.
+        """
+
+        when = now if now is not None else utcnow()
+        try:
+            stream_spec(
+                position.resolution_source,
+                seconds_between(position.event_start, position.window_end),
+            )
+        except UnrecognizedSettlementSource:
+            return None, None
+        try:
+            self._ingest(when)
+            opened = self._quote(position.event_start)
+            closed = self._quote(position.window_end)
+        except Exception:
+            return None, None
+        return opened.price, closed.price
+
     def window_close(self, position, now: datetime | None = None) -> WindowPrint | None:
-        """TWAP close and TWAP open for a paper settlement. None when either minute is short."""
+        """Strict TWAP close and TWAP open. None when either minute is short."""
 
         self.last_skip_reason = None
         when = now if now is not None else utcnow()
@@ -629,14 +693,33 @@ class ChainlinkFeed:
             return None
         return WindowPrint(open_price=opened.price, close_price=closed.price, completed=True)
 
-    def _quote(self, boundary: datetime) -> BoundaryTwap:
+    def _quote(self, boundary: datetime, *, fill_one: bool = False) -> BoundaryTwap:
         return boundary_twap(
             self.buffer.prices(),
             int(boundary.timestamp()),
             seconds=TWAP_SECONDS,
             offset=self.twap_offset_seconds,
             min_prints=self.min_twap_prints,
+            fill_one=fill_one,
         )
+
+    def _record_fills(self, slug: str, boundary: datetime, quote: BoundaryTwap, now: datetime) -> None:
+        boundary_text = iso_z(boundary)
+        for fill in quote.fills:
+            key = (slug, boundary_text, fill.second)
+            if key in self._noted_fills:
+                continue
+            self._noted_fills.add(key)
+            self._notes.append(
+                {
+                    "type": "twap_fill",
+                    "slug": slug,
+                    "boundary": boundary_text,
+                    "missing_second": fill.second,
+                    "filled_value": format(fill.value, "f"),
+                    "timestamp": iso_z(now),
+                }
+            )
 
     def _gap(self, kind: str, quote: BoundaryTwap, slug: str) -> str:
         reason = twap_gap_reason(kind, quote, slug)
