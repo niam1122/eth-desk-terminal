@@ -84,7 +84,7 @@ def test_freeze_appearing_before_the_fill_places_nothing(tmp_path):
                 volatility_per_sqrt_second=__import__("decimal").Decimal("0.001"),
             )
 
-        def window_close(self, position):
+        def window_close(self, position, now=None):
             return None
 
     class Model:
