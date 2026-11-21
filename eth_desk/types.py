@@ -62,12 +62,27 @@ class PricingInput:
     """Inputs the fair-value model is allowed to see.
 
     A replacement model should accept this object and return P(Up).
+
+    `observed_seconds` are already-printed Chainlink 1-second prices,
+    `(unix_second, price)`. Unix milliseconds (values at least 10**12) are
+    accepted. The second just before the settlement window (`window_end - 63`)
+    may be included and is used only to forward-fill a gap at the first
+    second. An empty tuple means a second at or before the model clock is
+    filled from the previous print, and from `current_price` when no earlier
+    print is available.
+
+    When `window_end_unix` and `as_of_unix` are both set, they are the model
+    clock: `as_of_unix` is the timestamp of `current_price`. `seconds_remaining`
+    is used only when `as_of_unix` is omitted.
     """
 
     open_price: Decimal
     current_price: Decimal
     seconds_remaining: Decimal
     volatility_per_sqrt_second: Decimal
+    observed_seconds: tuple[tuple[int, Decimal], ...] = ()
+    as_of_unix: int | None = None
+    window_end_unix: int | None = None
 
 
 @dataclass(frozen=True)

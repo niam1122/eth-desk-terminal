@@ -8,6 +8,7 @@ from decimal import Decimal
 from urllib.parse import urlparse
 
 from eth_desk.clock import iso_z, seconds_between
+from eth_desk.pricing import observed_settlement_seconds
 from eth_desk.types import Market, PricingInput
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
@@ -160,6 +161,13 @@ def volatility_per_sqrt_second(points: Sequence[tuple[int, Decimal]]) -> Decimal
     return mean_square.sqrt()
 
 
+def _unix_seconds(timestamp: int) -> int:
+    value = int(timestamp)
+    if value >= 1_000_000_000_000:
+        return value // 1000
+    return value
+
+
 def latest_fresh(
     points: Sequence[tuple[int, Decimal]],
     now_ms: int,
@@ -260,11 +268,23 @@ class ChainlinkFeed:
         volatility = volatility_per_sqrt_second(points)
         if volatility is None or volatility <= 0:
             return None
+        timestamp, _price = max(points, key=lambda item: item[0])
+        window_end_unix = int(market.end.timestamp())
+        # The 60-second TWAP topic is already an average, so those prints are
+        # not 1-second settlement inputs. The chainlink topic is. Open/close
+        # still come from the crypto-price endpoint until that series is wired
+        # through for the window boundaries as well.
+        observed = ()
+        if spec.topic == "crypto_prices_chainlink":
+            observed = observed_settlement_seconds(points, window_end_unix)
         return PricingInput(
             open_price=window.open_price,
             current_price=current,
             seconds_remaining=seconds_between(now, market.end),
             volatility_per_sqrt_second=volatility,
+            observed_seconds=observed,
+            as_of_unix=_unix_seconds(timestamp),
+            window_end_unix=window_end_unix,
         )
 
     def window_close(self, position) -> WindowPrint | None:
