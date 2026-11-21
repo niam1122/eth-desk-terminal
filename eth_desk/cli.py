@@ -46,7 +46,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--twap-min-prints",
         type=int,
         default=60,
-        help="Minimum 1s Chainlink prints required in that minute. Fewer skips the window (default 60).",
+        help=(
+            "Minimum 1s Chainlink prints required in that minute (default 60). "
+            "The open minute forward-fills a single missing second. "
+            "Fewer than this, after that fill, skips the window."
+        ),
     )
     return parser.parse_args(argv)
 

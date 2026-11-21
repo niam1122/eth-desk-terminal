@@ -5,9 +5,16 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from eth_desk.book import CLOB_HOST
 from eth_desk.clock import parse_time
 from eth_desk.fees import MissingFeeSchedule
 from eth_desk.http import HttpxJson
+from eth_desk.resolution import (
+    CLOB_WINNER_SOURCE,
+    Resolution,
+    condition_id_for_slug,
+    resolution_from_clob,
+)
 from eth_desk.types import FeeSchedule, Market, as_decimal
 
 GAMMA_HOST = "https://gamma-api.polymarket.com"
@@ -37,9 +44,23 @@ class RejectedMarket:
 
 
 class GammaClient:
-    def __init__(self, transport=None):
+    def __init__(self, transport=None, clob_transport=None):
         self.transport = transport or HttpxJson(GAMMA_HOST)
+        self.clob_transport = clob_transport or HttpxJson(CLOB_HOST)
         self.rejections: list[RejectedMarket] = []
+
+    def resolve(self, slug: str) -> Resolution:
+        """Resolved Up/Down winner for `slug`, or unresolved if Polymarket has not closed it.
+
+        The condition id is Gamma's. The winner is the CLOB token flag.
+        See ``eth_desk.resolution``.
+        """
+
+        condition_id = condition_id_for_slug(self.transport("/events", {"slug": slug}), slug)
+        if not condition_id:
+            return Resolution(False, None, CLOB_WINNER_SOURCE, "")
+        payload = self.clob_transport(f"/markets/{condition_id}")
+        return resolution_from_clob(payload, slug, condition_id)
 
     def discover(self) -> list[Market]:
         self.rejections = []

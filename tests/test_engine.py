@@ -10,7 +10,7 @@ from eth_desk.fees import taker_fee
 from eth_desk.geoblock import GeoblockStatus
 from eth_desk.journal import Journal
 from eth_desk.live import LiveGateway, LiveTradingDisabled
-from eth_desk.prices import WindowPrint
+from eth_desk.resolution import CLOB_WINNER_SOURCE, Resolution
 from eth_desk.state import DeskState
 from eth_desk.types import Ask, PricingInput
 
@@ -199,12 +199,15 @@ def test_settlement_uses_the_chainlink_open_and_close(tmp_path):
         def pricing_input(self, market, now):
             return None
 
-        def window_close(self, position, now=None):
-            return WindowPrint(Decimal("1564.18"), Decimal("1567.03"), True)
+        def settlement_prices(self, position, now=None):
+            return Decimal("1564.18"), Decimal("1567.03")
 
     class Gamma:
         def discover(self):
             return []
+
+        def resolve(self, slug):
+            return Resolution(True, "Up", CLOB_WINNER_SOURCE, "0xabc")
 
     log = tmp_path / "log.jsonl"
     journal = Journal(log, echo=None)
@@ -224,3 +227,5 @@ def test_settlement_uses_the_chainlink_open_and_close(tmp_path):
     settlement = next(row for row in _rows(log) if row["type"] == "settlement")
     assert settlement["won"] is True
     assert settlement["side"] == "Up"
+    assert settlement["resolution_source"] == CLOB_WINNER_SOURCE
+    assert not any(row["type"] == "settlement_mismatch" for row in _rows(log))

@@ -6,6 +6,7 @@ from decimal import Decimal
 from io import StringIO
 
 from eth_desk.cli import main
+from eth_desk.clock import iso_z
 from eth_desk.config import Settings
 from eth_desk.engine import Services, run
 from eth_desk.geoblock import GeoblockStatus
@@ -13,10 +14,13 @@ from eth_desk.journal import Journal
 from eth_desk.live import LiveGateway
 from eth_desk.prices import (
     ChainlinkFeed,
+    FilledPrint,
     StreamSpec,
     boundary_twap,
     points_from_message,
+    twap_gap_reason,
 )
+from eth_desk.resolution import CLOB_WINNER_SOURCE, Resolution
 from eth_desk.state import DeskState
 from eth_desk.types import Ask
 
@@ -107,8 +111,8 @@ def test_gap_skips_the_window_and_logs_the_reason(tmp_path):
     start_unix = int(START.timestamp())
     window = list(range(start_unix - 61, start_unix - 2 + 1))
     assert len(window) == 60
-    missing = window[10]
-    points = [(second * 1000, Decimal("2000")) for second in window if second != missing]
+    missing = {window[10], window[25]}
+    points = [(second * 1000, Decimal("2000")) for second in window if second not in missing]
     points.append((int(NOW.timestamp()) * 1000, Decimal("2001")))
     points.append(((int(NOW.timestamp()) - 1) * 1000, Decimal("2002")))
     seen = []
@@ -155,7 +159,7 @@ def test_gap_skips_the_window_and_logs_the_reason(tmp_path):
     assert not any(row["type"] == "fill" for row in rows)
     skips = [row for row in rows if row["type"] == "skip" and "twap_gap" in row["reason"]]
     assert len(skips) == 1
-    assert "59 of 60" in skips[0]["reason"]
+    assert "58 of 60" in skips[0]["reason"]
     assert "twap_gap open" in skips[0]["reason"]
     assert market.slug in skips[0]["reason"]
     assert skips[0]["slug"] == market.slug
@@ -209,6 +213,7 @@ def test_model_is_given_the_twap_open(tmp_path):
     rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
     assert any(row["type"] == "fill" for row in rows)
     assert not any(row["type"] == "skip" and "twap_gap" in row.get("reason", "") for row in rows)
+    assert not any(row["type"] == "twap_fill" for row in rows)
 
 
 def test_paper_settlement_uses_twap_close_versus_twap_open(tmp_path):
@@ -255,6 +260,9 @@ def test_paper_settlement_uses_twap_close_versus_twap_open(tmp_path):
         def discover(self):
             return []
 
+        def resolve(self, slug):
+            return Resolution(True, "Up", CLOB_WINNER_SOURCE, "0xabc")
+
     log = tmp_path / "log.jsonl"
     journal = Journal(log, echo=None)
     settings = Settings(
@@ -281,3 +289,153 @@ def test_paper_settlement_uses_twap_close_versus_twap_open(tmp_path):
     assert settlement["open_price"] != "999"
     assert settlement["won"] is True
     assert settlement["side"] == "Up"
+    assert settlement["resolution_source"] == CLOB_WINNER_SOURCE
+    assert not any(
+        row["type"] == "settlement_mismatch"
+        for row in (json.loads(line) for line in log.read_text().splitlines())
+    )
+
+
+def _open_window() -> tuple[int, list[int]]:
+    start_unix = int(START.timestamp())
+    window = list(range(start_unix - 61, start_unix - 2 + 1))
+    assert len(window) == 60
+    return start_unix, window
+
+
+def _numbered(window: list[int]) -> dict[int, Decimal]:
+    return {second: Decimal(index) for index, second in enumerate(window, start=1)}
+
+
+def test_complete_open_minute_is_unchanged_when_fill_is_allowed():
+    start_unix, window = _open_window()
+    prices = _numbered(window)
+    plain = boundary_twap(prices, start_unix, offset=2, min_prints=60)
+    filled = boundary_twap(prices, start_unix, offset=2, min_prints=60, fill_one=True)
+    assert plain.price == Decimal("30.5")
+    assert filled.price == plain.price
+    assert filled.count == 60
+    assert filled.fills == ()
+
+
+def test_one_missing_open_print_is_forward_filled_from_the_previous_second():
+    start_unix, window = _open_window()
+    prices = _numbered(window)
+    missing = window[10]
+    previous = window[9]
+    assert prices[previous] != prices[window[11]]
+    del prices[missing]
+    quote = boundary_twap(prices, start_unix, offset=2, min_prints=60, fill_one=True)
+    assert quote.fills == (FilledPrint(missing, prices[previous]),)
+    assert quote.count == 60
+    expected = dict(_numbered(window))
+    expected[missing] = prices[previous]
+    assert quote.price == _mean(expected.values())
+    raw = _mean(price for second, price in _numbered(window).items() if second != missing)
+    assert quote.price != raw
+
+
+def test_two_missing_open_prints_stay_a_gap():
+    start_unix, window = _open_window()
+    prices = _numbered(window)
+    del prices[window[10]]
+    del prices[window[25]]
+    quote = boundary_twap(prices, start_unix, offset=2, min_prints=60, fill_one=True)
+    assert quote.price is None
+    assert quote.count == 58
+    assert quote.fills == ()
+    reason = twap_gap_reason("open", quote, "eth-updown-15m-1795239000")
+    assert reason.startswith("twap_gap open: 58 of 60 ")
+    assert "eth-updown-15m-1795239000" in reason
+
+
+def test_missing_first_second_is_filled_from_the_next_value_not_the_second_before_the_window():
+    start_unix, window = _open_window()
+    prices = _numbered(window)
+    first = window[0]
+    nxt = window[1]
+    outside = first - 1
+    prices[outside] = Decimal("999999")
+    del prices[first]
+    quote = boundary_twap(prices, start_unix, offset=2, min_prints=60, fill_one=True)
+    assert quote.fills == (FilledPrint(first, prices[nxt]),)
+    assert quote.fills[0].value != Decimal("999999")
+    expected = dict(_numbered(window))
+    expected[first] = prices[nxt]
+    assert quote.price == _mean(expected.values())
+
+    points = [(second * 1000, price) for second, price in prices.items() if second != outside]
+    points.append((outside * 1000, Decimal("999999")))
+    now_unix = int(NOW.timestamp())
+    points.extend((second * 1000, Decimal(40 + (now_unix - second))) for second in range(now_unix - 12, now_unix + 1))
+
+    def boom(url, params):
+        raise AssertionError("spot endpoint must not be read")
+
+    feed = ChainlinkFeed(transport=boom, reader=lambda spec: points)
+    market = make_market()
+    assert feed.pricing_input(market, NOW) is not None
+    assert feed.pricing_input(market, NOW) is not None
+    notes = [row for row in feed.drain_notes() if row["type"] == "twap_fill"]
+    assert len(notes) == 1
+    assert notes[0]["slug"] == market.slug
+    assert notes[0]["boundary"] == iso_z(START)
+    assert notes[0]["missing_second"] == first
+    assert Decimal(notes[0]["filled_value"]) == prices[nxt]
+
+
+def test_one_missing_open_print_is_logged_and_priced(tmp_path):
+    start_unix, window = _open_window()
+    prices = _numbered(window)
+    missing = window[10]
+    previous = prices[window[9]]
+    del prices[missing]
+    expected = dict(_numbered(window))
+    expected[missing] = previous
+    expected_open = _mean(expected.values())
+    points = [(second * 1000, price) for second, price in prices.items()]
+    now_unix = int(NOW.timestamp())
+    points.extend((second * 1000, Decimal(40 + (now_unix - second))) for second in range(now_unix - 12, now_unix + 1))
+    market = make_market()
+    seen = []
+
+    class Gamma:
+        def discover(self):
+            return [market]
+
+    class Book:
+        def best_ask(self, token_id):
+            if token_id != "up-token":
+                return None
+            return Ask(Decimal("0.40"), Decimal("20"), Decimal("5"))
+
+    class Model:
+        name = "fixed"
+
+        def probability_up(self, data):
+            seen.append(data.open_price)
+            return Decimal("0.90")
+
+    def boom(url, params):
+        raise AssertionError("spot endpoint must not be read")
+
+    feed = ChainlinkFeed(transport=boom, reader=lambda spec: points)
+    log = tmp_path / "log.jsonl"
+    code = main(
+        ["--once", "--log", str(log), "--state", str(tmp_path / "state.json"), "--freeze", str(tmp_path / "FREEZE")],
+        services=Services(Allowed(), Gamma(), Book(), feed, Model(), LiveGateway(False)),
+        env={},
+        clock=lambda: NOW,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+    assert code == 0
+    assert seen == [expected_open]
+    rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    fills = [row for row in rows if row["type"] == "twap_fill"]
+    assert len(fills) == 1
+    assert fills[0]["slug"] == market.slug
+    assert fills[0]["boundary"] == iso_z(START)
+    assert fills[0]["missing_second"] == missing
+    assert Decimal(fills[0]["filled_value"]) == previous
+    assert not any(row["type"] == "skip" and "twap_gap" in row.get("reason", "") for row in rows)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from time import sleep as default_sleep
@@ -15,6 +15,7 @@ from eth_desk.limits import LAST_TRADE_SECONDS, LimitBreach, decide_bet
 from eth_desk.live import LiveGateway
 from eth_desk.paper import capped_fill
 from eth_desk.prices import up_wins
+from eth_desk.resolution import AWAITING_LOG_SECONDS, CLOB_WINNER_SOURCE, RESOLUTION_RETRY_SECONDS
 from eth_desk.state import DeskState
 from eth_desk.types import Market
 
@@ -69,6 +70,7 @@ def run(settings: Settings, services: Services, state: DeskState, journal: Journ
 
 
 def _run_loop(settings, services, state, journal, clock, sleep, last_heartbeat, announced, noted) -> None:
+    retry = SettlementRetry()
     while True:
         now = clock()
         _drain_feed_status(services, journal)
@@ -86,13 +88,21 @@ def _run_loop(settings, services, state, journal, clock, sleep, last_heartbeat, 
                 open_positions=len(state.positions),
             )
             last_heartbeat = now
-        if _settle_due(state, services, journal, now):
+        if _settle_due(state, services, journal, now, retry):
             state.save(settings.state_path)
         _trade(settings, services, state, journal, now, announced, noted)
         if settings.once:
             journal.daily_summary(state.summary())
             return
         sleep(settings.interval_seconds)
+
+
+def _drain_notes(services: Services, journal: Journal) -> None:
+    drain = getattr(services.feed, "drain_notes", None)
+    if not callable(drain):
+        return
+    for record in drain():
+        journal.write(record)
 
 
 def _drain_feed_status(services: Services, journal: Journal) -> None:
@@ -115,42 +125,82 @@ def _halt_if_frozen(settings: Settings, journal: Journal, now: datetime) -> None
         raise FreezeHalt(freeze_message(settings.freeze_path))
 
 
-def _settle_due(state: DeskState, services: Services, journal: Journal, now: datetime) -> bool:
+class SettlementRetry:
+    """Per-position timers so an unresolved market is not polled every loop."""
+
+    def __init__(self) -> None:
+        self.next_attempt: dict[int, datetime] = {}
+        self.next_awaiting_log: dict[int, datetime] = {}
+
+
+def _settle_due(
+    state: DeskState,
+    services: Services,
+    journal: Journal,
+    now: datetime,
+    retry: SettlementRetry | None = None,
+) -> bool:
+    """Settle ended positions from Polymarket's resolved winner.
+
+    The close TWAP is recorded when the minute is complete, and a disagreement
+    with that TWAP is logged. A missing close TWAP does not keep the position
+    open. An unresolved market is retried on `RESOLUTION_RETRY_SECONDS` and
+    logs `awaiting_resolution` at most once per `AWAITING_LOG_SECONDS`.
+    Positions already loaded from the state file use this same path.
+    """
+
+    if retry is None:
+        retry = SettlementRetry()
     changed = False
+    fetched: dict[str, object] = {}
+    failed: dict[str, str] = {}
+    logged_failure: set[str] = set()
     for position in list(state.positions):
         if now < position.window_end:
             continue
-        try:
-            printed = services.feed.window_close(position, now)
-        except Exception as exc:
-            journal.write(
-                {
-                    "type": "error",
-                    "where": "settle",
-                    "market_id": position.market_id,
-                    "error": type(exc).__name__,
-                }
-            )
+        key = id(position)
+        due = retry.next_attempt.get(key)
+        if due is not None and now < due:
             continue
-        if printed is None or printed.open_price is None or printed.close_price is None:
-            reason = getattr(services.feed, "last_skip_reason", None)
-            if reason:
+        slug = position.slug
+        if slug not in fetched and slug not in failed:
+            try:
+                fetched[slug] = _lookup_resolution(services, slug)
+            except Exception as exc:
+                failed[slug] = type(exc).__name__
+        if slug in failed:
+            if slug not in logged_failure:
+                logged_failure.add(slug)
                 journal.write(
                     {
-                        "type": "skip",
+                        "type": "error",
                         "where": "settle",
                         "market_id": position.market_id,
-                        "slug": position.slug,
-                        "side": position.side,
-                        "reason": reason,
+                        "slug": slug,
+                        "error": failed[slug],
                         "timestamp": now.isoformat(),
                     }
                 )
+            retry.next_attempt[key] = now + timedelta(seconds=RESOLUTION_RETRY_SECONDS)
             continue
-        if printed.open_price <= 0 or printed.close_price <= 0:
+        resolved, winner, source = _read_resolution(fetched[slug])
+        if not resolved or winner not in {"Up", "Down"}:
+            retry.next_attempt[key] = now + timedelta(seconds=RESOLUTION_RETRY_SECONDS)
+            log_at = retry.next_awaiting_log.get(key)
+            if log_at is None or now >= log_at:
+                journal.write(
+                    {
+                        "type": "awaiting_resolution",
+                        "market_id": position.market_id,
+                        "slug": slug,
+                        "side": position.side,
+                        "timestamp": now.isoformat(),
+                    }
+                )
+                retry.next_awaiting_log[key] = now + timedelta(seconds=AWAITING_LOG_SECONDS)
             continue
-        settled_up = up_wins(printed.open_price, printed.close_price)
-        won = settled_up if position.side == "Up" else not settled_up
+        open_price, close_price = _prices_for_settlement(services, position, now)
+        won = winner == position.side
         pnl = state.apply_settlement(position, won, now)
         journal.write(
             {
@@ -160,13 +210,91 @@ def _settle_due(state: DeskState, services: Services, journal: Journal, now: dat
                 "won": won,
                 "pnl": format(pnl, "f"),
                 "fee": format(position.fee, "f"),
-                "open_price": format(printed.open_price, "f"),
-                "close_price": format(printed.close_price, "f"),
+                "open_price": _plain_price(open_price),
+                "close_price": _plain_price(close_price),
+                "resolution_source": source,
                 "timestamp": now.isoformat(),
             }
         )
+        implied = _implied_winner(open_price, close_price)
+        if implied is not None and implied != winner:
+            journal.write(
+                {
+                    "type": "settlement_mismatch",
+                    "market_id": position.market_id,
+                    "slug": slug,
+                    "side": position.side,
+                    "polymarket_winner": winner,
+                    "twap_winner": implied,
+                    "open_price": _plain_price(open_price),
+                    "close_price": _plain_price(close_price),
+                    "timestamp": now.isoformat(),
+                }
+            )
+        retry.next_attempt.pop(key, None)
+        retry.next_awaiting_log.pop(key, None)
         changed = True
     return changed
+
+
+def _lookup_resolution(services: Services, slug: str):
+    resolver = getattr(services.gamma, "resolve", None)
+    if not callable(resolver):
+        raise RuntimeError("resolution lookup is not configured")
+    return resolver(slug)
+
+
+def _read_resolution(result: object) -> tuple[bool, str | None, str]:
+    if result is None:
+        return False, None, CLOB_WINNER_SOURCE
+    resolved = bool(getattr(result, "resolved", False))
+    winner = getattr(result, "winner", None)
+    source = getattr(result, "source", None) or CLOB_WINNER_SOURCE
+    if winner is not None:
+        winner = str(winner)
+    return resolved, winner, str(source)
+
+
+def _prices_for_settlement(services: Services, position, now: datetime) -> tuple[Decimal | None, Decimal | None]:
+    twap_open, twap_close = _settlement_prices(services, position, now)
+    open_price = twap_open if twap_open is not None else getattr(position, "open_price", None)
+    return _price(open_price), twap_close
+
+
+def _settlement_prices(services: Services, position, now: datetime) -> tuple[Decimal | None, Decimal | None]:
+    method = getattr(services.feed, "settlement_prices", None)
+    if not callable(method):
+        return None, None
+    try:
+        opened, closed = method(position, now)
+    except Exception:
+        return None, None
+    return _price(opened), _price(closed)
+
+
+def _price(value) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _plain_price(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(value, "f")
+
+
+def _implied_winner(open_price: Decimal | None, close_price: Decimal | None) -> str | None:
+    if open_price is None or close_price is None:
+        return None
+    if open_price <= 0 or close_price <= 0:
+        return None
+    return "Up" if up_wins(open_price, close_price) else "Down"
 
 
 def _trade(settings, services, state, journal, now, announced: set[str], noted: set[str]) -> None:
@@ -224,6 +352,8 @@ def _consider(settings, services, state, journal, now, market: Market, noted: se
             }
         )
         return
+    finally:
+        _drain_notes(services, journal)
     if pricing is None:
         reason = getattr(services.feed, "last_skip_reason", None) or "no_settlement_price"
         _skip(journal, market, "", reason, now)
