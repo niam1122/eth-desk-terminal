@@ -15,7 +15,7 @@ from eth_desk.geoblock import GeoblockClient, GeoblockRefusal
 from eth_desk.journal import Journal
 from eth_desk.live import LiveGateway, live_armed, missing_live_credentials
 from eth_desk.prices import ChainlinkFeed
-from eth_desk.pricing import ZeroDriftLognormalModel
+from eth_desk.pricing import TwapSettlementModel
 from eth_desk.redact import secrets_from_env
 from eth_desk.state import StateError, load_or_fresh
 
@@ -45,7 +45,7 @@ def default_services(mode: str) -> Services:
         gamma=GammaClient(),
         book=ClobBook(),
         feed=ChainlinkFeed(),
-        model=ZeroDriftLognormalModel(),
+        model=TwapSettlementModel(),
         gateway=LiveGateway(armed=(mode == "live")),
     )
 

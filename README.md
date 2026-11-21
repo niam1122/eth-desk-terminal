@@ -52,10 +52,12 @@ Hard limits are constants in `eth_desk/limits.py`. Environment variables cannot 
 2. Load the ETH 15-minute series from gamma (`eth-up-or-down-15m`) and the open events on that series.
 3. Read each market's rules from the payload: `resolutionSource`, `feeSchedule` (`rate`, `exponent`, `takerOnly`, `rebateRate`), `feesEnabled`, and `orderMinSize`.
 4. Settle any paper position whose window has ended, using that market's Chainlink open and close. Up wins when the close print is greater than or equal to the open print.
-5. Inside the last 4 minutes, price P(Up) from the window open, the live settlement-stream price, time left, and recent volatility.
+5. Inside the last 4 minutes, price P(Up) with the Chainlink 60-second TWAP model from the window open, the live settlement-stream price, time left, recent volatility, and any 1-second settlement prints already observed.
 6. In paper mode, buy at the best ask only, and only up to the size resting at that price. Charge the taker fee from that market's schedule.
 
-The fair-value model is `eth_desk.pricing.ZeroDriftLognormalModel`. Replace it by passing any object with `probability_up(PricingInput) -> Decimal` into the engine. `PricingInput` carries the open price, the current settlement-stream price, seconds remaining, and volatility per square-root-second.
+The default fair-value model is `eth_desk.pricing.TwapSettlementModel`. Settlement is Up when the Chainlink ETH/USD 60-second TWAP at the window end is greater than or equal to the same TWAP at the window start, and a tie is Up. That TWAP is the average of 60 consecutive 1-second Chainlink prices (`crypto_prices_chainlink`, `eth/usd`). The two alignments that match the published boundaries (seconds −62..−3 and −61..−2) are blended, with half weight on the two endpoints. Unprinted seconds of that window are driftless Brownian motion with covariance `min(τ_i, τ_j)`; prints already in hand are plugged in at their prices. P(Up) = Φ((m − O) / s). Far from expiry this is close to Φ(ln(S/O) / (σ √(T − 40s))). `ZeroDriftLognormalModel` is the plain spot formula and remains available. Replace either model by passing any object with `probability_up(PricingInput) -> Decimal` into the engine.
+
+`PricingInput` carries the open, the current price, seconds remaining, and volatility per square-root-second. Optional `observed_seconds`, `as_of_unix`, and `window_end_unix` carry 1-second prints from the settlement window. The default volatility estimator once a minute of history is available is an EWMA of 1-minute log returns with a 1-hour half-life (`ewma_sigma_per_sqrt_second`). The live loop still estimates volatility from the stream snapshot it has.
 
 ## Hard limits
 
@@ -84,7 +86,15 @@ Rounded half-up to 5 decimal places. Anything under 0.00001 USDC is charged as 0
 
 ## Prices
 
-`resolutionSource` on current ETH 15-minute markets is `https://data.chain.link/streams/eth-usd-twap-60s-streams`. The window open (and the close, once the window is over) is read from Polymarket's public crypto-price endpoint with `symbol=ETH` and `variant=fifteen`. That variant is the Chainlink series: on the windows observed while building this, each window's close equalled the next window's open. The live price and the volatility sample come from Polymarket's public RTDS topic `crypto_prices_twap_sixty` for `eth/usd`, which is the 60-second Chainlink ETH/USD TWAP. A market whose resolution source is not that Chainlink ETH stream is not priced and is not traded.
+`resolutionSource` on current ETH 15-minute markets is `https://data.chain.link/streams/eth-usd-twap-60s-streams`. The window open (and the close, once the window is over) is read from Polymarket's public crypto-price endpoint with `symbol=ETH` and `variant=fifteen`. That endpoint returns the Chainlink boundary spot, not the 60-second settlement TWAP; the open and close used for a paper settlement will move to the TWAP reconstructed from the 1-second stream separately. On the windows observed while building this, each window's crypto-price close equalled the next window's open. The live price and the volatility sample come from Polymarket's public RTDS topic `crypto_prices_twap_sixty` for `eth/usd`. When the feed is on `crypto_prices_chainlink` instead, 1-second prints inside the settlement window are passed through on `PricingInput.observed_seconds` (`observed_settlement_seconds`). A market whose resolution source is not a Chainlink ETH stream is not priced and is not traded.
+
+## Backtest
+
+```bash
+python scripts/backtest_twap_model.py
+```
+
+Fetches recent resolved `eth-updown-15m-<unix>` windows from gamma and Binance ETHUSDT 1-second klines, scores `TwapSettlementModel` and `ZeroDriftLognormalModel` at 600, 300, 120, 60, 30, and 10 seconds left, and prints Brier scores and a calibration table. Both S and the price to beat are taken from the Binance series, so a constant USDT/USD basis drops out of moneyness and out of returns. The label is the real resolution (`finalPrice >= priceToBeat`). Sigma is the 1-minute EWMA with a 1-hour half-life, using only prices at or before the checkpoint. The script does not send orders.
 
 ## Logs
 
