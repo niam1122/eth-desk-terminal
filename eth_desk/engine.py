@@ -57,8 +57,21 @@ def run(settings: Settings, services: Services, state: DeskState, journal: Journ
     last_heartbeat: datetime | None = None
     announced: set[str] = set()
     noted: set[str] = set()
+    starter = getattr(services.feed, "start", None)
+    if callable(starter):
+        starter()
+    try:
+        _run_loop(settings, services, state, journal, clock, sleep, last_heartbeat, announced, noted)
+    finally:
+        stopper = getattr(services.feed, "stop", None)
+        if callable(stopper):
+            stopper()
+
+
+def _run_loop(settings, services, state, journal, clock, sleep, last_heartbeat, announced, noted) -> None:
     while True:
         now = clock()
+        _drain_feed_status(services, journal)
         _halt_if_frozen(settings, journal, now)
         rolled = state.sync_day(now)
         if rolled is not None:
@@ -80,6 +93,14 @@ def run(settings: Settings, services: Services, state: DeskState, journal: Journ
             journal.daily_summary(state.summary())
             return
         sleep(settings.interval_seconds)
+
+
+def _drain_feed_status(services: Services, journal: Journal) -> None:
+    drain = getattr(services.feed, "drain_status", None)
+    if not callable(drain):
+        return
+    for record in drain():
+        journal.write(record)
 
 
 def _halt_if_frozen(settings: Settings, journal: Journal, now: datetime) -> None:

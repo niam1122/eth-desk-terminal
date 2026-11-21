@@ -90,7 +90,7 @@ A market with no `feeSchedule`, or with no rate or exponent, or with an exponent
 
 ## Prices
 
-`resolutionSource` on current ETH 15-minute markets is `https://data.chain.link/streams/eth-usd-twap-60s-streams`. The window open, and the close used for paper settlement, are the plain average of 60 one-second Chainlink ETH/USD prints from RTDS topic `crypto_prices_chainlink` (symbol `eth/usd`). Those seconds are the 60 ending `--twap-offset` seconds before the boundary (default 2): from `boundary - offset - 59` through `boundary - offset`. The feed keeps a rolling buffer of the prints. If a boundary has fewer than `--twap-min-prints` of them (default 60), that window is not traded and the log records `twap_gap` with the count and the slug. The TWAP open is what the fair-odds model receives. Paper settlement compares the TWAP close with the TWAP open. The current price, the volatility sample, and `PricingInput.observed_seconds` come from the same 1-second buffer. The crypto-price endpoint is not used for the open or the close. A market whose resolution source is not a Chainlink ETH stream is not priced and is not traded.
+`resolutionSource` on current ETH 15-minute markets is `https://data.chain.link/streams/eth-usd-twap-60s-streams`. The window open, and the close used for paper settlement, are the plain average of 60 one-second Chainlink ETH/USD prints from RTDS topic `crypto_prices_chainlink` (symbol `eth/usd`). One websocket stays open for the life of the process (`wss://ws-live-data.polymarket.com`), sends `PING` every 5 seconds, and reconnects after 1 second if the socket drops. The first message after subscribe is a backfill of about the last minute on topic `crypto_prices` (`payload.data`); later messages are single `crypto_prices_chainlink` ticks. Timestamps are milliseconds and are stored as unix seconds. The first print in each second is kept. Those seconds are the 60 ending `--twap-offset` seconds before the boundary (default 2): from `boundary - offset - 59` through `boundary - offset`. If a boundary has fewer than `--twap-min-prints` of them (default 60), that window is not traded and the log records `twap_gap` with the count and the slug. The TWAP open is what the fair-odds model receives. Paper settlement compares the TWAP close with the TWAP open. The current price, the volatility sample, and `PricingInput.observed_seconds` come from the same 1-second buffer. The crypto-price endpoint is not used for the open or the close. A market whose resolution source is not a Chainlink ETH stream is not priced and is not traded.
 
 ## Backtest
 
@@ -107,7 +107,7 @@ Fetches recent resolved `eth-updown-15m-<unix>` windows from gamma and Binance E
 - `fill` — condition id, market slug, side (`Up` or `Down`), price, shares (and `size`, the same share count), fee in USD, fee rate, fee exponent, best ask, size available at that ask, fair probability, edge, mode, and a UTC timestamp ending in `Z`
 - `heartbeat` — about once a minute, also echoed as a single stdout line
 - `daily_summary` — PnL after fees, fill count, win rate of settled paper trades, fees paid. Written at UTC day change and when the process stops
-- `market_rules`, `settlement`, `skip`, `freeze`
+- `market_rules`, `settlement`, `skip`, `freeze`, `rtds` (connect, disconnect, reconnect)
 
 Win rate is settled wins divided by settled trades. Fills that have not resolved yet are not in that ratio.
 
@@ -120,4 +120,4 @@ pip install -r requirements.txt
 pytest
 ```
 
-Network tests are not part of `pytest`. Fixtures under `tests/fixtures/` are trimmed recordings of gamma, the geoblock response, a CLOB book, a completed crypto-price window, and one RTDS TWAP tick.
+Network tests are not part of `pytest`. Fixtures under `tests/fixtures/` are trimmed recordings of gamma, the geoblock response, a CLOB book, a completed crypto-price window, one RTDS TWAP tick, and a Chainlink 1-second subscribe backfill plus one live tick.

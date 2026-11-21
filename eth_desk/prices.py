@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +17,13 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 CRYPTO_PRICE_URL = "https://polymarket.com/api/crypto/crypto-price"
 CHAINLINK_1S_TOPIC = "crypto_prices_chainlink"
 CHAINLINK_1S_SYMBOL = "eth/usd"
+# The subscribe backfill arrives on this topic, not on crypto_prices_chainlink.
+# Confirmed live: type "subscribe", payload.symbol "eth/usd", payload.data is
+# the recent one-second history. Live ticks then use crypto_prices_chainlink.
+CHAINLINK_HISTORY_TOPIC = "crypto_prices"
+RTDS_PING_SECONDS = 5.0
+RTDS_RECONNECT_SECONDS = 1.0
+_log = logging.getLogger("eth_desk.prices")
 # Plain average of this many 1-second Chainlink prints. Not the blended
 # weights inside TwapSettlementModel; those stay on the probability model.
 TWAP_SECONDS = 60
@@ -123,9 +132,55 @@ def parse_price_point(row: dict) -> tuple[int, Decimal]:
     return timestamp, Decimal(str(row["value"]))
 
 
+def accepted_topics(spec: StreamSpec) -> set[str]:
+    """Topics that carry this spec's prints.
+
+    The chainlink subscription's first payload is a history snapshot labeled
+    `crypto_prices`. Later ticks are `crypto_prices_chainlink`.
+    """
+
+    topics = {spec.topic}
+    if spec.topic == CHAINLINK_1S_TOPIC:
+        topics.add(CHAINLINK_HISTORY_TOPIC)
+    return topics
+
+
+def chainlink_subscribe_message(spec: StreamSpec) -> dict:
+    """RTDS subscribe frame. `filters` is a JSON string, not an object."""
+
+    return {
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": spec.topic,
+                "type": "*",
+                "filters": json.dumps({"symbol": spec.symbol}, separators=(",", ":")),
+            }
+        ],
+    }
+
+
+def points_from_frame(raw: str | bytes, spec: StreamSpec) -> list[tuple[int, Decimal]]:
+    """Prints from one websocket frame. Non-JSON frames (PING replies, empties) are ignored."""
+
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    else:
+        text = raw
+    if not text or not text.lstrip().startswith("{"):
+        return []
+    try:
+        message = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(message, dict):
+        return []
+    return points_from_message(message, spec)
+
+
 def points_from_message(message: dict, spec: StreamSpec) -> list[tuple[int, Decimal]]:
     topic = message.get("topic")
-    if topic is not None and topic != spec.topic:
+    if topic is not None and topic not in accepted_topics(spec):
         return []
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     symbol = payload.get("symbol")
@@ -191,56 +246,132 @@ def latest_fresh(
     return price
 
 
-def read_rtds_points(spec: StreamSpec, *, url: str = RTDS_URL, wait_seconds: float = 3.0):
-    """Subscribe to one Chainlink topic and collect the snapshot plus live ticks."""
+def _short_error(exc: BaseException) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    return text[:200]
 
-    import asyncio
 
-    import websockets
+class RtdsChainlinkSession:
+    """One background thread and one RTDS websocket for the 1-second Chainlink feed.
 
-    async def _read() -> list[tuple[int, Decimal]]:
-        points: list[tuple[int, Decimal]] = []
+    The socket stays open, sends the text frame `PING` every 5 seconds, and on
+    any error waits 1 second, reconnects, and subscribes again. The server's
+    first message after subscribe refills about the last minute.
+    """
+
+    def __init__(self, spec: StreamSpec, buffer: ChainlinkPrintBuffer, url: str = RTDS_URL):
+        self.spec = spec
+        self.buffer = buffer
+        self.url = url
+        self.connected = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._events: list[dict] = []
+        self._events_lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="rtds-chainlink", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=5)
+
+    def drain_status(self) -> list[dict]:
+        with self._events_lock:
+            events = self._events
+            self._events = []
+        return events
+
+    def _emit(self, event: str, **fields: object) -> None:
+        record = {
+            "type": "rtds",
+            "event": event,
+            "topic": self.spec.topic,
+            "symbol": self.spec.symbol,
+            "timestamp": iso_z(utcnow()),
+        }
+        record.update(fields)
+        with self._events_lock:
+            self._events.append(record)
+        detail = fields.get("error") or ""
+        _log.info("rtds %s %s %s", event, self.spec.topic, detail)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._session()
+            except Exception as exc:
+                self.connected = False
+                self._emit("disconnect", error=_short_error(exc))
+            else:
+                self.connected = False
+                if self._stop.is_set():
+                    self._emit("disconnect")
+                    return
+                self._emit("disconnect", error="closed")
+            if self._stop.is_set():
+                return
+            self._emit("reconnect", wait_seconds=RTDS_RECONNECT_SECONDS)
+            if self._stop.wait(RTDS_RECONNECT_SECONDS):
+                return
+
+    def _session(self) -> None:
+        import asyncio
+
+        asyncio.run(self._async_session())
+
+    async def _async_session(self) -> None:
+        import asyncio
+
+        import websockets
+
         async with websockets.connect(
-            url,
+            self.url,
             additional_headers={
                 "User-Agent": "eth-desk/0.1",
                 "Origin": "https://polymarket.com",
             },
-            open_timeout=10,
+            open_timeout=20,
             close_timeout=2,
+            max_size=8_000_000,
         ) as ws:
-            subscription = {
-                "action": "subscribe",
-                "subscriptions": [
-                    {
-                        "topic": spec.topic,
-                        "type": "*",
-                        "filters": json.dumps({"symbol": spec.symbol}),
-                    }
-                ],
-            }
-            await ws.send(json.dumps(subscription))
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + wait_seconds
-            while True:
-                timeout = deadline - loop.time()
-                if timeout <= 0:
-                    break
+            self.connected = True
+            self._emit("connect")
+            await ws.send(json.dumps(chainlink_subscribe_message(self.spec)))
+            ping = asyncio.create_task(self._ping(ws))
+            try:
+                while not self._stop.is_set():
+                    if ping.done():
+                        error = ping.exception()
+                        if error is not None:
+                            raise error
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    points = points_from_frame(raw, self.spec)
+                    if points:
+                        self.buffer.extend(points)
+            finally:
+                ping.cancel()
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
-                if not raw:
-                    continue
-                try:
-                    message = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(message, dict):
-                    points.extend(points_from_message(message, spec))
-        return points
+                    await ping
+                except asyncio.CancelledError:
+                    pass
+                self.connected = False
 
-    return asyncio.run(_read())
+    async def _ping(self, ws) -> None:
+        import asyncio
+
+        while True:
+            await asyncio.sleep(RTDS_PING_SECONDS)
+            await ws.send("PING")
 
 
 @dataclass(frozen=True)
@@ -336,51 +467,63 @@ class _SecondPrint:
 
 
 class ChainlinkPrintBuffer:
-    """Rolling 1-second Chainlink prints, one price per unix second."""
+    """Rolling 1-second Chainlink prints, one price per unix second.
+
+    Millisecond timestamps are stored under `timestamp // 1000`. The first
+    print that arrives for a second is kept; a later tick in that same second
+    does not replace it.
+    """
 
     def __init__(self, max_age_seconds: int = _BUFFER_MAX_AGE_SECONDS):
         self.max_age_seconds = max_age_seconds
         self._by_second: dict[int, _SecondPrint] = {}
+        self._lock = threading.Lock()
 
     def extend(self, points: Sequence[tuple[int, Decimal]]) -> None:
-        for timestamp, price in points:
-            if price is None or price <= 0:
-                continue
-            timestamp_ms = _as_unix_ms(int(timestamp))
-            second = _unix_seconds(timestamp_ms)
-            current = self._by_second.get(second)
-            if current is None or timestamp_ms >= current.timestamp_ms:
-                self._by_second[second] = _SecondPrint(timestamp_ms, price)
+        with self._lock:
+            for timestamp, price in points:
+                if price is None or price <= 0:
+                    continue
+                timestamp_ms = _as_unix_ms(int(timestamp))
+                second = _unix_seconds(timestamp_ms)
+                if second not in self._by_second:
+                    self._by_second[second] = _SecondPrint(timestamp_ms, price)
 
     def prune(self, now_unix: int) -> None:
         cutoff = int(now_unix) - self.max_age_seconds
-        if not self._by_second:
-            return
-        self._by_second = {
-            second: item for second, item in self._by_second.items() if second >= cutoff
-        }
+        with self._lock:
+            if not self._by_second:
+                return
+            self._by_second = {
+                second: item for second, item in self._by_second.items() if second >= cutoff
+            }
 
     def prices(self) -> dict[int, Decimal]:
-        return {second: item.price for second, item in self._by_second.items()}
+        with self._lock:
+            return {second: item.price for second, item in self._by_second.items()}
 
     def points(self) -> list[tuple[int, Decimal]]:
-        return [(item.timestamp_ms, item.price) for item in self._by_second.values()]
+        with self._lock:
+            return [(item.timestamp_ms, item.price) for item in self._by_second.values()]
 
 
 class ChainlinkFeed:
     """Window open and close from the 1-second Chainlink settlement prints.
 
-    The buffer is filled from RTDS topic `crypto_prices_chainlink` (symbol
-    `eth/usd`). The open, and the close used for paper settlement, are the
+    The buffer is filled by one persistent RTDS connection to
+    `crypto_prices_chainlink` (symbol `eth/usd`): the subscribe backfill plus
+    each live tick. The open, and the close used for paper settlement, are the
     plain average of the 60 prints ending `twap_offset_seconds` before the
     boundary (default 2). The crypto-price endpoint is not consulted.
     `last_skip_reason` is set when the minute does not have enough prints.
+
+    Pass `reader` only to inject prints in tests. The default opens the live socket.
     """
 
     def __init__(
         self,
         transport=None,
-        reader=read_rtds_points,
+        reader=None,
         price_url: str = CRYPTO_PRICE_URL,
         *,
         twap_offset_seconds: int = DEFAULT_TWAP_OFFSET_SECONDS,
@@ -409,6 +552,22 @@ class ChainlinkFeed:
         )
         self.last_skip_reason: str | None = None
         self.last_refresh_error: str | None = None
+        self._session = (
+            RtdsChainlinkSession(self.chainlink_spec, self.buffer) if reader is None else None
+        )
+
+    def start(self) -> None:
+        if self._session is not None:
+            self._session.start()
+
+    def stop(self) -> None:
+        if self._session is not None:
+            self._session.stop()
+
+    def drain_status(self) -> list[dict]:
+        if self._session is None:
+            return []
+        return self._session.drain_status()
 
     def pricing_input(self, market: Market, now: datetime) -> PricingInput | None:
         self.last_skip_reason = None
@@ -486,6 +645,11 @@ class ChainlinkFeed:
         return reason
 
     def _ingest(self, now: datetime) -> None:
+        if self._session is not None:
+            self._session.start()
+            self.last_refresh_error = None
+            self.buffer.prune(int(now.timestamp()))
+            return
         try:
             points = self.reader(self.chainlink_spec) or []
         except Exception as exc:
