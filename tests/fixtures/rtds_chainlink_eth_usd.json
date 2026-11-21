@@ -1,0 +1,27 @@
+[
+  {
+    "payload": {
+      "data": [
+        {"timestamp": 1795255176000, "value": 1635.989684528424},
+        {"timestamp": 1795255177000, "value": 1635.9795033863086},
+        {"timestamp": 1795255234000, "value": 1634.08254394787}
+      ],
+      "symbol": "eth/usd"
+    },
+    "timestamp": 1795255235079,
+    "topic": "crypto_prices",
+    "type": "subscribe"
+  },
+  {
+    "connection_id": "ghafc6-5lWeIKEhYKA==",
+    "payload": {
+      "full_accuracy_value": "1634089349944644400000",
+      "symbol": "eth/usd",
+      "timestamp": 1795255235000,
+      "value": 1634.0893499446445
+    },
+    "timestamp": 1795255235917,
+    "topic": "crypto_prices_chainlink",
+    "type": "update"
+  }
+]
