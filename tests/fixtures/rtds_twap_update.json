@@ -1,0 +1,13 @@
+{
+  "connection_id": "example",
+  "payload": {
+    "full_accuracy_value": "1559707972235504648192",
+    "symbol": "eth/usd",
+    "timestamp": 1795239848000,
+    "value": 1559.7079722355047,
+    "window_s": 60
+  },
+  "timestamp": 1795239849463,
+  "topic": "crypto_prices_twap_sixty",
+  "type": "update"
+}

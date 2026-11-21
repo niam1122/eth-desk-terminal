@@ -1,0 +1,10 @@
+{
+  "id": "10191",
+  "ticker": "eth-up-or-down-15m",
+  "slug": "eth-up-or-down-15m",
+  "title": "ETH Up or Down 15m",
+  "seriesType": "single",
+  "recurrence": "15m",
+  "active": true,
+  "closed": false
+}
