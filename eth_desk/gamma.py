@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -18,11 +19,30 @@ class MarketRulesError(ValueError):
     """A market looks like ETH 15m but its rules could not be read."""
 
 
+class FeeScheduleRejected(MissingFeeSchedule):
+    """The market has no usable feeSchedule. Discovery skips this market only."""
+
+    def __init__(self, slug: str, reason: str, market_id: str = ""):
+        super().__init__(reason)
+        self.slug = slug
+        self.reason = reason
+        self.market_id = market_id
+
+
+@dataclass(frozen=True)
+class RejectedMarket:
+    market_id: str
+    slug: str
+    reason: str
+
+
 class GammaClient:
     def __init__(self, transport=None):
         self.transport = transport or HttpxJson(GAMMA_HOST)
+        self.rejections: list[RejectedMarket] = []
 
     def discover(self) -> list[Market]:
+        self.rejections = []
         series_rows = self.transport("/series", {"slug": SERIES_SLUG})
         if not isinstance(series_rows, list) or not series_rows:
             raise MarketRulesError(f"gamma series {SERIES_SLUG} was not found")
@@ -44,7 +64,13 @@ class GammaClient:
         markets: list[Market] = []
         for event in events:
             for raw in event.get("markets") or []:
-                parsed = parse_market(raw)
+                try:
+                    parsed = parse_market(raw)
+                except FeeScheduleRejected as exc:
+                    self.rejections.append(
+                        RejectedMarket(market_id=exc.market_id, slug=exc.slug, reason=exc.reason)
+                    )
+                    continue
                 if parsed is not None:
                     markets.append(parsed)
         return markets
@@ -91,16 +117,21 @@ def parse_market(raw: dict[str, Any]) -> Market | None:
 
 
 def parse_fee_schedule(raw: dict[str, Any], slug: str) -> FeeSchedule:
+    market_id = str(raw.get("id") or "")
     if "feesEnabled" not in raw:
         raise MarketRulesError(f"{slug} is missing feesEnabled")
     enabled = bool(raw.get("feesEnabled"))
     schedule = raw.get("feeSchedule")
     if not isinstance(schedule, dict):
-        raise MissingFeeSchedule(f"{slug} is missing feeSchedule")
-    if enabled and ("rate" not in schedule or "exponent" not in schedule):
-        raise MissingFeeSchedule(f"{slug} feeSchedule is missing rate or exponent")
-    rate = as_decimal(schedule["rate"]) if "rate" in schedule else Decimal("0")
-    exponent = as_decimal(schedule["exponent"]) if "exponent" in schedule else Decimal("0")
+        raise FeeScheduleRejected(slug, f"missing feeSchedule for {slug}", market_id)
+    if "rate" not in schedule or "exponent" not in schedule:
+        raise FeeScheduleRejected(
+            slug,
+            f"missing feeSchedule rate or exponent for {slug}",
+            market_id,
+        )
+    rate = as_decimal(schedule["rate"])
+    exponent = as_decimal(schedule["exponent"])
     rebate = as_decimal(schedule["rebateRate"]) if schedule.get("rebateRate") is not None else Decimal("0")
     return FeeSchedule(
         exponent=exponent,

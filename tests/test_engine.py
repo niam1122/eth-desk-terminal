@@ -54,7 +54,7 @@ def test_paper_loop_buys_the_ask_up_to_book_size_and_logs_the_fill(tmp_path):
         def pricing_input(self, market, now):
             return PricingInput(Decimal("1560"), Decimal("1564"), Decimal("180"), Decimal("0.001"))
 
-        def window_close(self, position):
+        def window_close(self, position, now=None):
             return None
 
     out = StringIO()
@@ -121,7 +121,7 @@ def test_live_flag_is_required_and_the_stub_does_not_fill(tmp_path):
         def pricing_input(self, market, now):
             return PricingInput(Decimal("1560"), Decimal("1564"), Decimal("180"), Decimal("0.001"))
 
-        def window_close(self, position):
+        def window_close(self, position, now=None):
             return None
 
     err = StringIO()
@@ -199,7 +199,7 @@ def test_settlement_uses_the_chainlink_open_and_close(tmp_path):
         def pricing_input(self, market, now):
             return None
 
-        def window_close(self, position):
+        def window_close(self, position, now=None):
             return WindowPrint(Decimal("1564.18"), Decimal("1567.03"), True)
 
     class Gamma:

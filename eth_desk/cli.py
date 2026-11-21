@@ -36,15 +36,35 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--state", default="state/desk.json", help="Persisted bankroll and daily stop.")
     parser.add_argument("--freeze", default="FREEZE", help="Path of the FREEZE file. Exists means stop.")
     parser.add_argument("--heartbeat", type=float, default=60.0, help="Seconds between heartbeat lines.")
+    parser.add_argument(
+        "--twap-offset",
+        type=int,
+        default=2,
+        help="Seconds before each window boundary where the 60s settlement TWAP ends (default 2).",
+    )
+    parser.add_argument(
+        "--twap-min-prints",
+        type=int,
+        default=60,
+        help="Minimum 1s Chainlink prints required in that minute. Fewer skips the window (default 60).",
+    )
     return parser.parse_args(argv)
 
 
-def default_services(mode: str) -> Services:
+def default_services(
+    mode: str,
+    *,
+    twap_offset_seconds: int = 2,
+    min_twap_prints: int = 60,
+) -> Services:
     return Services(
         geoblock=GeoblockClient(),
         gamma=GammaClient(),
         book=ClobBook(),
-        feed=ChainlinkFeed(),
+        feed=ChainlinkFeed(
+            twap_offset_seconds=twap_offset_seconds,
+            min_twap_prints=min_twap_prints,
+        ),
         model=TwapSettlementModel(),
         gateway=LiveGateway(armed=(mode == "live")),
     )
@@ -67,6 +87,12 @@ def main(
     now_fn = utcnow if clock is None else clock
     if args.interval <= 0 or args.heartbeat <= 0:
         print("Refusing to start: --interval and --heartbeat must be positive.", file=err)
+        return 1
+    if args.twap_offset < 0 or not 1 <= args.twap_min_prints <= 60:
+        print(
+            "Refusing to start: --twap-offset must be >= 0 and --twap-min-prints must be from 1 to 60.",
+            file=err,
+        )
         return 1
     if args.live and not live_armed(True, environment):
         print(
@@ -111,7 +137,15 @@ def main(
     except StateError as exc:
         print(f"Refusing to start: {exc}", file=err)
         return 1
-    active = services if services is not None else default_services(mode)
+    active = (
+        services
+        if services is not None
+        else default_services(
+            mode,
+            twap_offset_seconds=args.twap_offset,
+            min_twap_prints=args.twap_min_prints,
+        )
+    )
     try:
         run(
             settings,
