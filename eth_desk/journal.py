@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from eth_desk.clock import iso_z
 from eth_desk.redact import redact
 from eth_desk.types import Fill
 
@@ -15,6 +16,44 @@ def _plain(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def fill_audit(
+    fill: Fill,
+    *,
+    condition_id: str,
+    slug: str,
+    fee_rate: Decimal,
+    fee_exponent: Decimal,
+    best_ask: Decimal,
+    best_ask_size: Decimal,
+) -> dict[str, Any]:
+    """Fields the auditor reads on every paper and live fill.
+
+    `shares` is the filled size. `best_ask_size` is the size resting at the
+    ask before the cap, which can be larger. `size` is kept as the same share
+    count so older readers still see it. Nothing here is a credential.
+    """
+
+    shares = _plain(fill.size)
+    return {
+        "mode": fill.mode,
+        "market_id": fill.market_id,
+        "condition_id": condition_id,
+        "slug": slug,
+        "side": fill.side,
+        "price": _plain(fill.price),
+        "size": shares,
+        "shares": shares,
+        "fee": _plain(fill.fee),
+        "fee_rate": _plain(fee_rate),
+        "fee_exponent": _plain(fee_exponent),
+        "best_ask": _plain(best_ask),
+        "best_ask_size": _plain(best_ask_size),
+        "fair_prob": _plain(fill.fair_prob),
+        "edge": _plain(fill.edge),
+        "timestamp": iso_z(fill.timestamp),
+    }
 
 
 class Journal:
@@ -65,21 +104,28 @@ class Journal:
             )
         return record
 
-    def fill(self, fill: Fill) -> dict[str, Any]:
-        return self.write(
-            {
-                "type": "fill",
-                "mode": fill.mode,
-                "market_id": fill.market_id,
-                "side": fill.side,
-                "price": _plain(fill.price),
-                "size": _plain(fill.size),
-                "fee": _plain(fill.fee),
-                "fair_prob": _plain(fill.fair_prob),
-                "edge": _plain(fill.edge),
-                "timestamp": fill.timestamp.isoformat(),
-            }
+    def fill(
+        self,
+        fill: Fill,
+        *,
+        condition_id: str,
+        slug: str,
+        fee_rate: Decimal,
+        fee_exponent: Decimal,
+        best_ask: Decimal,
+        best_ask_size: Decimal,
+    ) -> dict[str, Any]:
+        record = fill_audit(
+            fill,
+            condition_id=condition_id,
+            slug=slug,
+            fee_rate=fee_rate,
+            fee_exponent=fee_exponent,
+            best_ask=best_ask,
+            best_ask_size=best_ask_size,
         )
+        record["type"] = "fill"
+        return self.write(record)
 
     def daily_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
         record = self.write(summary)

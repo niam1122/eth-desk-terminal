@@ -18,7 +18,7 @@ from eth_desk.pricing import (
 )
 from eth_desk.types import PricingInput
 
-from tests.helpers import END, make_market
+from tests.helpers import END, START, make_market
 
 END_UNIX = 1_700_000_000
 SIGMA = Decimal("0.0001")
@@ -208,27 +208,53 @@ def test_bad_prices_and_unaligned_observations_are_rejected():
         )
 
 
-def test_chainlink_prints_flow_through_and_twap_prints_do_not():
-    base = int((END - timedelta(seconds=45)).timestamp())
-    points = [((base + i) * 1000, Decimal(2000 + i)) for i in range(10)]
+def test_chainlink_second_prints_set_the_open_for_twap_markets():
+    """The open is the 1s Chainlink average, including on eth-usd-twap-60s markets."""
+
+    end_unix = int(END.timestamp())
+    start_unix = int(START.timestamp())
+    open_start = start_unix - 61
+    open_end = start_unix - 2
+    open_points = [
+        (second * 1000, Decimal(1000 + (second - open_start)))
+        for second in range(open_start, open_end + 1)
+    ]
+    expected_open = sum((price for _ts, price in open_points), Decimal(0)) / Decimal(60)
+    base = end_unix - 45
+    recent = [((base + i) * 1000, Decimal(2000 + i)) for i in range(10)]
+    points = open_points + recent
     now = END - timedelta(seconds=30)
+    seen = []
+
+    def reader(spec):
+        seen.append(spec)
+        return points
 
     def transport(url, params):
-        return {"openPrice": "1990", "closePrice": None, "completed": False}
+        raise AssertionError("crypto-price spot endpoint must not supply the open")
 
-    chainlink = replace(make_market(), resolution_source="https://data.chain.link/streams/eth-usd")
-    priced = ChainlinkFeed(transport=transport, reader=lambda spec: points).pricing_input(chainlink, now)
+    priced = ChainlinkFeed(transport=transport, reader=reader).pricing_input(make_market(), now)
     assert priced is not None
-    assert priced.window_end_unix == int(END.timestamp())
+    assert priced.open_price == expected_open
+    assert priced.open_price != Decimal("1990")
+    assert seen[0].topic == "crypto_prices_chainlink"
+    assert seen[0].symbol == "eth/usd"
     assert dict(priced.observed_seconds)[base] == Decimal(2000)
     assert base + 9 in dict(priced.observed_seconds)
+    assert priced.as_of_unix == base + 9
+    assert priced.window_end_unix == end_unix
 
-    twap = ChainlinkFeed(transport=transport, reader=lambda spec: points).pricing_input(make_market(), now)
-    assert twap is not None
-    assert twap.observed_seconds == ()
-    assert twap.as_of_unix == base + 9
-    assert twap.window_end_unix == int(END.timestamp())
+    plain = replace(make_market(), resolution_source="https://data.chain.link/streams/eth-usd")
+    other = ChainlinkFeed(transport=transport, reader=reader).pricing_input(plain, now)
+    assert other is not None
+    assert other.open_price == expected_open
+    assert dict(other.observed_seconds)[base] == Decimal(2000)
 
 
 def test_default_model_is_the_twap_settlement_model():
-    assert isinstance(default_services("paper").model, TwapSettlementModel)
+    services = default_services("paper")
+    assert isinstance(services.model, TwapSettlementModel)
+    assert services.feed.twap_offset_seconds == 2
+    assert services.feed.min_twap_prints == 60
+    assert services.feed.chainlink_spec.topic == "crypto_prices_chainlink"
+    assert services.feed.chainlink_spec.symbol == "eth/usd"

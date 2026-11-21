@@ -8,8 +8,9 @@ from time import sleep as default_sleep
 
 from eth_desk.clock import iso_z, seconds_between
 from eth_desk.config import Settings
+from eth_desk.fees import fee_schedule_block_reason
 from eth_desk.geoblock import GeoblockRefusal, refusal_message
-from eth_desk.journal import Journal
+from eth_desk.journal import Journal, fill_audit
 from eth_desk.limits import LAST_TRADE_SECONDS, LimitBreach, decide_bet
 from eth_desk.live import LiveGateway
 from eth_desk.paper import capped_fill
@@ -55,6 +56,7 @@ def run(settings: Settings, services: Services, state: DeskState, journal: Journ
 
     last_heartbeat: datetime | None = None
     announced: set[str] = set()
+    noted: set[str] = set()
     while True:
         now = clock()
         _halt_if_frozen(settings, journal, now)
@@ -73,7 +75,7 @@ def run(settings: Settings, services: Services, state: DeskState, journal: Journ
             last_heartbeat = now
         if _settle_due(state, services, journal, now):
             state.save(settings.state_path)
-        _trade(settings, services, state, journal, now, announced)
+        _trade(settings, services, state, journal, now, announced, noted)
         if settings.once:
             journal.daily_summary(state.summary())
             return
@@ -98,7 +100,7 @@ def _settle_due(state: DeskState, services: Services, journal: Journal, now: dat
         if now < position.window_end:
             continue
         try:
-            printed = services.feed.window_close(position)
+            printed = services.feed.window_close(position, now)
         except Exception as exc:
             journal.write(
                 {
@@ -110,6 +112,19 @@ def _settle_due(state: DeskState, services: Services, journal: Journal, now: dat
             )
             continue
         if printed is None or printed.open_price is None or printed.close_price is None:
+            reason = getattr(services.feed, "last_skip_reason", None)
+            if reason:
+                journal.write(
+                    {
+                        "type": "skip",
+                        "where": "settle",
+                        "market_id": position.market_id,
+                        "slug": position.slug,
+                        "side": position.side,
+                        "reason": reason,
+                        "timestamp": now.isoformat(),
+                    }
+                )
             continue
         if printed.open_price <= 0 or printed.close_price <= 0:
             continue
@@ -133,20 +148,40 @@ def _settle_due(state: DeskState, services: Services, journal: Journal, now: dat
     return changed
 
 
-def _trade(settings, services, state, journal, now, announced: set[str]) -> None:
+def _trade(settings, services, state, journal, now, announced: set[str], noted: set[str]) -> None:
     try:
         markets = services.gamma.discover()
     except Exception as exc:
         journal.write({"type": "error", "where": "discover", "error": type(exc).__name__})
         return
+    for rejected in getattr(services.gamma, "rejections", ()) or ():
+        if rejected.slug in noted:
+            continue
+        noted.add(rejected.slug)
+        journal.write(
+            {
+                "type": "skip",
+                "market_id": rejected.market_id,
+                "slug": rejected.slug,
+                "side": "",
+                "reason": rejected.reason,
+                "timestamp": now.isoformat(),
+            }
+        )
     for market in markets:
         if market.market_id not in announced:
             journal.write(_rules_record(market))
             announced.add(market.market_id)
-        _consider(settings, services, state, journal, now, market)
+        _consider(settings, services, state, journal, now, market, noted)
 
 
-def _consider(settings, services, state, journal, now, market: Market) -> None:
+def _consider(settings, services, state, journal, now, market: Market, noted: set[str]) -> None:
+    blocked = fee_schedule_block_reason(market)
+    if blocked:
+        if market.slug not in noted:
+            _skip(journal, market, "", blocked, now)
+            noted.add(market.slug)
+        return
     if market.closed or not market.accepting_orders or not market.enable_order_book:
         return
     remaining = seconds_between(now, market.end)
@@ -169,7 +204,8 @@ def _consider(settings, services, state, journal, now, market: Market) -> None:
         )
         return
     if pricing is None:
-        _skip(journal, market, "", "no_settlement_price", now)
+        reason = getattr(services.feed, "last_skip_reason", None) or "no_settlement_price"
+        _skip(journal, market, "", reason, now)
         return
     try:
         probability_up = services.model.probability_up(pricing)
@@ -243,12 +279,21 @@ def _consider(settings, services, state, journal, now, market: Market) -> None:
         fair_prob=fair,
         now=now,
         window_start=iso_z(market.event_start),
-        mode="paper",
+        mode=settings.mode,
     )
     if fill is None:
         _skip(journal, market, side, "paper_cap", now)
         return
     _halt_if_frozen(settings, journal, now)
+    audit = fill_audit(
+        fill,
+        condition_id=market.condition_id,
+        slug=market.slug,
+        fee_rate=market.fee_schedule.rate,
+        fee_exponent=market.fee_schedule.exponent,
+        best_ask=ask.price,
+        best_ask_size=ask.size,
+    )
     if settings.mode == "live":
         result = services.gateway.place(
             {
@@ -260,17 +305,8 @@ def _consider(settings, services, state, journal, now, market: Market) -> None:
                 "fee": format(fill.fee, "f"),
             }
         )
-        journal.write(
-            {
-                "type": "live_stub",
-                "sent": bool(result.get("sent")),
-                "market_id": market.market_id,
-                "side": side,
-                "price": format(fill.price, "f"),
-                "size": format(fill.size, "f"),
-                "timestamp": now.isoformat(),
-            }
-        )
+        sent = bool(result.get("sent"))
+        journal.write({"type": "live_stub", "sent": sent, **audit})
         return
     try:
         state.commit_fill(
@@ -286,7 +322,15 @@ def _consider(settings, services, state, journal, now, market: Market) -> None:
     except LimitBreach as exc:
         _skip(journal, market, side, exc.reason, now)
         return
-    journal.fill(fill)
+    journal.fill(
+        fill,
+        condition_id=market.condition_id,
+        slug=market.slug,
+        fee_rate=market.fee_schedule.rate,
+        fee_exponent=market.fee_schedule.exponent,
+        best_ask=ask.price,
+        best_ask_size=ask.size,
+    )
     state.save(settings.state_path)
 
 
@@ -295,6 +339,7 @@ def _skip(journal: Journal, market: Market, side: str, reason: str, now: datetim
         {
             "type": "skip",
             "market_id": market.market_id,
+            "slug": market.slug,
             "side": side,
             "reason": reason,
             "timestamp": now.isoformat(),

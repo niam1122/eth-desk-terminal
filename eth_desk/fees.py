@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 
-from eth_desk.types import FeeSchedule
+from eth_desk.types import FeeSchedule, Market
+
+# The published taker formula is `shares × rate × p × (1 − p)`, which is the
+# general schedule with exponent 1. Any other exponent is not traded.
+SUPPORTED_FEE_EXPONENT = Decimal("1")
 
 # Polymarket rounds taker fees to 5 decimal places (0.00001 USDC).
 FEE_QUANTUM = Decimal("0.00001")
@@ -38,3 +42,20 @@ def taker_fee(shares: Decimal, price: Decimal, schedule: FeeSchedule) -> Decimal
     if raw < FEE_QUANTUM:
         return Decimal("0")
     return raw.quantize(FEE_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def fee_schedule_block_reason(market: Market) -> str | None:
+    """Why this market must not be traded, or None when its schedule is usable.
+
+    The rate still comes from the market. Only the exponent is constrained:
+    missing fee data, and any exponent other than 1, are skipped. The slug is
+    part of the reason so the log line names the market.
+    """
+
+    slug = market.slug
+    schedule = market.fee_schedule
+    if schedule is None:
+        return f"missing feeSchedule for {slug}"
+    if schedule.exponent != SUPPORTED_FEE_EXPONENT:
+        return f"feeSchedule exponent {format(schedule.exponent, 'f')} != 1 for {slug}"
+    return None
